@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin/internal/bytesconv"
@@ -24,6 +25,15 @@ var (
 	default405Body   = []byte("405 method not allowed")
 	defaultAppEngine bool
 )
+
+// defaultTrustedCIDRs is the parsed form of the default value of
+// Engine.TrustedProxies ("0.0.0.0/0"). It is used to initialize
+// Engine.trustedCIDRs so that engines served through http.Server (i.e. without
+// calling Engine.Run) keep honouring the RemoteIPHeaders by default.
+var defaultTrustedCIDRs = []*net.IPNet{{ // 0.0.0.0/0 (for IPv4)
+	IP:   net.IP{0x0, 0x0, 0x0, 0x0},
+	Mask: net.IPMask{0x0, 0x0, 0x0, 0x0},
+}}
 
 // HandlerFunc defines the handler used by gin middleware as return value.
 type HandlerFunc func(*Context)
@@ -80,9 +90,26 @@ type Engine struct {
 	// If no other Method is allowed, the request is delegated to the NotFound
 	// handler.
 	HandleMethodNotAllowed bool
-	ForwardedByClientIP    bool
 
-	// #726 #755 If enabled, it will thrust some headers starting with
+	// If enabled, client IP will be parsed from the request's headers that
+	// match those stored at `(*gin.Engine).RemoteIPHeaders`. If no IP was
+	// fetched, it falls back to the IP obtained from
+	// `(*gin.Context).Request.RemoteAddr`.
+	ForwardedByClientIP bool
+
+	// List of headers used to obtain the client IP when
+	// `(*gin.Engine).ForwardedByClientIP` is `true` and
+	// `(*gin.Context).Request.RemoteAddr` is matched by at least one of the
+	// network origins of `(*gin.Engine).TrustedProxies`.
+	RemoteIPHeaders []string
+
+	// List of network origins (IPv4 addresses, IPv4 CIDRs, IPv6 addresses or
+	// IPv6 CIDRs) from which to trust request's headers that contain
+	// alternative client IP when `(*gin.Engine).ForwardedByClientIP` is
+	// `true`.
+	TrustedProxies []string
+
+	// #726 #755 If enabled, it will trust some headers starting with
 	// 'X-AppEngine...' for better integration with that PaaS.
 	AppEngine bool
 
@@ -112,6 +139,7 @@ type Engine struct {
 	noMethod         HandlersChain
 	pool             sync.Pool
 	trees            methodTrees
+	trustedCIDRs     []*net.IPNet
 }
 
 var _ IRouter = &Engine{}
@@ -137,6 +165,8 @@ func New() *Engine {
 		RedirectFixedPath:      false,
 		HandleMethodNotAllowed: false,
 		ForwardedByClientIP:    true,
+		RemoteIPHeaders:        []string{"X-Forwarded-For", "X-Real-IP"},
+		TrustedProxies:         []string{"0.0.0.0/0"},
 		AppEngine:              defaultAppEngine,
 		UseRawPath:             false,
 		RemoveExtraSlash:       false,
@@ -145,6 +175,7 @@ func New() *Engine {
 		trees:                  make(methodTrees, 0, 9),
 		delims:                 render.Delims{Left: "{{", Right: "}}"},
 		secureJsonPrefix:       "while(1);",
+		trustedCIDRs:           defaultTrustedCIDRs,
 	}
 	engine.RouterGroup.engine = engine
 	engine.pool.New = func() interface{} {
@@ -296,10 +327,76 @@ func iterate(path, method string, routes RoutesInfo, root *node) RoutesInfo {
 func (engine *Engine) Run(addr ...string) (err error) {
 	defer func() { debugPrintError(err) }()
 
+	if err = engine.parseTrustedProxies(); err != nil {
+		return err
+	}
 	address := resolveAddress(addr)
 	debugPrint("Listening and serving HTTP on %s\n", address)
 	err = http.ListenAndServe(address, engine)
 	return
+}
+
+// SetTrustedProxies set a list of network origins (IPv4 addresses,
+// IPv4 CIDRs, IPv6 addresses or IPv6 CIDRs) from which to trust
+// request's headers that contain alternative client IP when
+// `(*gin.Engine).ForwardedByClientIP` is `true`. `TrustedProxies`
+// feature is enabled by default, and it also trusts all proxies
+// by default. If you want to disable this feature, use
+// Engine.SetTrustedProxies(nil), then Context.ClientIP() will
+// return the remote address directly.
+func (engine *Engine) SetTrustedProxies(trustedProxies []string) error {
+	engine.TrustedProxies = trustedProxies
+	return engine.parseTrustedProxies()
+}
+
+// parseTrustedProxies parse Engine.TrustedProxies to Engine.trustedCIDRs
+func (engine *Engine) parseTrustedProxies() error {
+	trustedCIDRs, err := engine.prepareTrustedCIDRs()
+	engine.trustedCIDRs = trustedCIDRs
+	return err
+}
+
+func (engine *Engine) prepareTrustedCIDRs() ([]*net.IPNet, error) {
+	if engine.TrustedProxies == nil {
+		return nil, nil
+	}
+
+	cidr := make([]*net.IPNet, 0, len(engine.TrustedProxies))
+	for _, trustedProxy := range engine.TrustedProxies {
+		if !strings.Contains(trustedProxy, "/") {
+			ip := parseIP(trustedProxy)
+			if ip == nil {
+				return cidr, &net.ParseError{Type: "IP address", Text: trustedProxy}
+			}
+
+			switch len(ip) {
+			case net.IPv4len:
+				trustedProxy += "/32"
+			case net.IPv6len:
+				trustedProxy += "/128"
+			}
+		}
+		_, cidrNet, err := net.ParseCIDR(trustedProxy)
+		if err != nil {
+			return cidr, err
+		}
+		cidr = append(cidr, cidrNet)
+	}
+	return cidr, nil
+}
+
+// parseIP parse a string representation of an IP and returns a net.IP with the
+// minimum byte representation or nil if input is invalid.
+func parseIP(ip string) net.IP {
+	parsedIP := net.ParseIP(ip)
+
+	if ipv4 := parsedIP.To4(); ipv4 != nil {
+		// return ip in a 4-byte representation
+		return ipv4
+	}
+
+	// return ip in a 16-byte representation or nil
+	return parsedIP
 }
 
 // RunTLS attaches the router to a http.Server and starts listening and serving HTTPS (secure) requests.
