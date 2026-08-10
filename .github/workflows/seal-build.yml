@@ -1,0 +1,105 @@
+# Authored by Seal: upstream gin 1.6.3 has no GitHub Actions CI at all — it is
+# tested on Travis CI (.travis.yml). The build/test steps below are translated
+# from .travis.yml and the repo Makefile.
+name: seal-build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go for the x/mod zip helper
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+
+      - name: Build the x/mod zip helper
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/helper"
+          cd "$RUNNER_TEMP/helper"
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[3])
+              if err != nil {
+                  panic(err)
+              }
+              defer f.Close()
+              mv := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              if err := zip.CreateFromDir(f, mv, os.Args[4]); err != nil {
+                  panic(err)
+              }
+          }
+          EOF
+          go mod init sealhelper
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+
+      - name: Create the module zip
+        run: |
+          set -eux
+          # Zip a pristine copy: the released v1.6.3.zip was produced from the
+          # git tag, which predates this Seal CI workflow, so drop the workflow
+          # directory we added and the VCS metadata before zipping.
+          mkdir -p "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/out"
+          cp -r "$GITHUB_WORKSPACE/." "$RUNNER_TEMP/modsrc/"
+          rm -rf "$RUNNER_TEMP/modsrc/.git" "$RUNNER_TEMP/modsrc/.github/workflows"
+          "$RUNNER_TEMP/create_mod" github.com/gin-gonic/gin v1.6.3 "$RUNNER_TEMP/out/v1.6.3.zip" "$RUNNER_TEMP/modsrc"
+          unzip -l "$RUNNER_TEMP/out/v1.6.3.zip" | head -40
+
+      - name: Upload the module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v1.6.3.zip
+          if-no-files-found: error
+
+  test:
+    name: test go${{ matrix.go }} ${{ matrix.makeargs }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - go: "1.13.x"
+            makeargs: ""
+          - go: "1.13.x"
+            makeargs: "TESTTAGS=nomsgpack"
+          - go: "1.14.x"
+            makeargs: ""
+          - go: "1.14.x"
+            makeargs: "TESTTAGS=nomsgpack"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: go mod download
+        run: go mod download
+
+      - name: make vet
+        run: make vet
+
+      - name: make fmt-check
+        run: make fmt-check
+
+      - name: make test
+        run: make test ${{ matrix.makeargs }}
